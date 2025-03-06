@@ -5,6 +5,7 @@ import "core:log"
 import "core:math/linalg"
 import "core:mem"
 import sdl "vendor:sdl3"
+import stbi "vendor:stb/image"
 
 default_context: runtime.Context
 
@@ -37,23 +38,61 @@ main :: proc() {
 
 	ok = sdl.ClaimWindowForGPUDevice(gpu, window);assert(ok)
 
-	vert_shader := load_shader(gpu, vert_shader_code, .VERTEX, 1)
-	frag_shader := load_shader(gpu, frag_shader_code, .FRAGMENT, 0)
+	vert_shader := load_shader(
+		gpu,
+		vert_shader_code,
+		.VERTEX,
+		num_uniform_buffers = 1,
+		num_samplers = 0,
+	)
+	frag_shader := load_shader(
+		gpu,
+		frag_shader_code,
+		.FRAGMENT,
+		num_uniform_buffers = 0,
+		num_samplers = 1,
+	)
+
+	img_size: [2]i32
+	pixels := stbi.load(
+		"cobblestone_1.png",
+		&img_size.x,
+		&img_size.y,
+		nil,
+		4,
+	);assert(pixels != nil)
+	pixels_byte_size := img_size.x * img_size.y * 4
+
+	texture := sdl.CreateGPUTexture(
+		gpu,
+		{
+			format = .R8G8B8A8_UNORM,
+			usage = {.SAMPLER},
+			width = u32(img_size.x),
+			height = u32(img_size.y),
+			layer_count_or_depth = 1,
+			num_levels = 1,
+		},
+	)
 
 	Vec3 :: [3]f32
 
 	Vertex_Data :: struct {
 		pos:   Vec3,
 		color: sdl.FColor,
+		uv:    [2]f32,
 	}
 
+	WHITE := sdl.FColor{1, 1, 1, 1}
+
 	vertices := []Vertex_Data {
-		{pos = {-0.5, 0.5, 0}, color = {1, 0, 0, 1}},
-		{pos = {0.5, 0.5, 0}, color = {0, 1, 1, 1}},
-		{pos = {-0.5, -0.5, 0}, color = {1, 0, 1, 1}},
-		{pos = {0.5, -0.5, 0}, color = {1, 0, 1, 1}},
+		{pos = {-0.5, 0.5, 0}, color = WHITE, uv = {0, 0}},
+		{pos = {0.5, 0.5, 0}, color = WHITE, uv = {1, 0}},
+		{pos = {-0.5, -0.5, 0}, color = WHITE, uv = {0, 1}},
+		{pos = {0.5, -0.5, 0}, color = WHITE, uv = {1, 1}},
 	}
 	vertices_byte_size := len(vertices) * size_of(vertices[0])
+
 	indices := []u16{0, 1, 2, 2, 1, 3}
 	indices_byte_size := len(indices) * size_of(indices[0])
 
@@ -69,6 +108,14 @@ main :: proc() {
 	mem.copy(transfer_mem, raw_data(vertices), vertices_byte_size)
 	mem.copy(transfer_mem[vertices_byte_size:], raw_data(indices), indices_byte_size)
 	sdl.UnmapGPUTransferBuffer(gpu, transfer_buf)
+
+	tex_transfer_buf := sdl.CreateGPUTransferBuffer(
+		gpu,
+		{usage = .UPLOAD, size = u32(pixels_byte_size)},
+	)
+	tex_transfer_mem := sdl.MapGPUTransferBuffer(gpu, tex_transfer_buf, false)
+	mem.copy(tex_transfer_mem, pixels, int(pixels_byte_size))
+	sdl.UnmapGPUTransferBuffer(gpu, tex_transfer_buf)
 
 	copy_cmd_buf := sdl.AcquireGPUCommandBuffer(gpu)
 
@@ -88,15 +135,26 @@ main :: proc() {
 		false,
 	)
 
+	sdl.UploadToGPUTexture(
+		copy_pass,
+		{transfer_buffer = tex_transfer_buf},
+		{texture = texture, w = u32(img_size.x), h = u32(img_size.y), d = 1},
+		false,
+	)
+
 	sdl.EndGPUCopyPass(copy_pass)
 
 	ok = sdl.SubmitGPUCommandBuffer(copy_cmd_buf);assert(ok)
 
 	sdl.ReleaseGPUTransferBuffer(gpu, transfer_buf)
+	sdl.ReleaseGPUTransferBuffer(gpu, tex_transfer_buf)
+
+	sampler := sdl.CreateGPUSampler(gpu, {})
 
 	vertex_attrs := []sdl.GPUVertexAttribute {
 		{location = 0, format = .FLOAT3, offset = u32(offset_of(Vertex_Data, pos))},
 		{location = 1, format = .FLOAT4, offset = u32(offset_of(Vertex_Data, color))},
+		{location = 2, format = .FLOAT2, offset = u32(offset_of(Vertex_Data, uv))},
 	}
 
 	pipeline := sdl.CreateGPUGraphicsPipeline(
@@ -176,7 +234,7 @@ main :: proc() {
 
 		rotation += ROTATION_SPEED * delta_time
 		model_mat :=
-			linalg.matrix4_translate_f32({0, 0, -5}) *
+			linalg.matrix4_translate_f32({0, 0, -2}) *
 			linalg.matrix4_rotate_f32(rotation, {0, 1, 0})
 
 		ubo := UBO {
@@ -200,6 +258,12 @@ main :: proc() {
 			)
 			sdl.BindGPUIndexBuffer(render_pass, {buffer = index_buf}, ._16BIT)
 			sdl.PushGPUVertexUniformData(cmd_buf, 0, &ubo, size_of(ubo))
+			sdl.BindGPUFragmentSamplers(
+				render_pass,
+				0,
+				&(sdl.GPUTextureSamplerBinding{texture = texture, sampler = sampler}),
+				1,
+			)
 			sdl.DrawGPUIndexedPrimitives(render_pass, 6, 1, 0, 0, 0)
 			sdl.EndGPURenderPass(render_pass)
 		}
@@ -213,6 +277,7 @@ load_shader :: proc(
 	code: []u8,
 	stage: sdl.GPUShaderStage,
 	num_uniform_buffers: u32,
+	num_samplers: u32,
 ) -> ^sdl.GPUShader {
 	return sdl.CreateGPUShader(
 		device,
@@ -223,6 +288,7 @@ load_shader :: proc(
 			format = {.SPIRV},
 			stage = stage,
 			num_uniform_buffers = num_uniform_buffers,
+			num_samplers = num_samplers,
 		},
 	)
 }
