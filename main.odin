@@ -4,13 +4,24 @@ import "base:runtime"
 import "core:log"
 import "core:math/linalg"
 import "core:mem"
+import "core:slice"
+import "core:strings"
 import sdl "vendor:sdl3"
 import stbi "vendor:stb/image"
 
 default_context: runtime.Context
 
-frag_shader_code := #load("shader.spv.frag")
-vert_shader_code := #load("shader.spv.vert")
+when ODIN_OS == .Windows {
+	GPU_SHADER_FORMAT: sdl.GPUShaderFormat = {.SPIRV}
+	entrypoint := "main"
+	frag_shader_code := #load("shader.spv.frag")
+	vert_shader_code := #load("shader.spv.vert")
+} else when ODIN_OS == .Darwin {
+	GPU_SHADER_FORMAT: sdl.GPUShaderFormat = {.MSL}
+	entrypoint := "main0"
+	frag_shader_code := #load("shader.metal.frag")
+	vert_shader_code := #load("shader.metal.vert")
+}
 
 main :: proc() {
 	context.logger = log.create_console_logger()
@@ -34,7 +45,7 @@ main :: proc() {
 
 	window := sdl.CreateWindow("Hello SDL3", 1280, 780, {});assert(window != nil)
 
-	gpu := sdl.CreateGPUDevice({.SPIRV}, true, nil);assert(gpu != nil)
+	gpu := sdl.CreateGPUDevice(GPU_SHADER_FORMAT, true, nil);assert(gpu != nil)
 
 	ok = sdl.ClaimWindowForGPUDevice(gpu, window);assert(ok)
 
@@ -187,8 +198,13 @@ main :: proc() {
 	win_size: [2]i32
 	ok = sdl.GetWindowSize(window, &win_size.x, &win_size.y);assert(ok)
 
-	ROTATION_SPEED := linalg.to_radians(f32(90))
-	rotation := f32(0)
+	// Movement configuration
+	MOVE_SPEED :: f32(1.5) // Adjust this to control movement speed
+	position := [2]f32{0, 0} // Initial position
+
+	// Keyboard state tracking
+	keyboard_state: [^]u8
+	keyboard_state_len: i32
 
 	proj_mat := linalg.matrix4_perspective_f32(
 		linalg.to_radians(f32(70)),
@@ -219,7 +235,15 @@ main :: proc() {
 			}
 		}
 
+		// Get current keyboard state
+		keyboard_state = cast([^]u8)sdl.GetKeyboardState(&keyboard_state_len)
+
 		// update game state
+		// Handle WASD movement using keyboard state
+		if keyboard_state[int(sdl.Scancode.W)] != 0 do position.y += MOVE_SPEED * delta_time
+		if keyboard_state[int(sdl.Scancode.S)] != 0 do position.y -= MOVE_SPEED * delta_time
+		if keyboard_state[int(sdl.Scancode.A)] != 0 do position.x -= MOVE_SPEED * delta_time
+		if keyboard_state[int(sdl.Scancode.D)] != 0 do position.x += MOVE_SPEED * delta_time
 
 		// render
 		cmd_buf := sdl.AcquireGPUCommandBuffer(gpu)
@@ -232,10 +256,8 @@ main :: proc() {
 			nil,
 		);assert(ok)
 
-		rotation += ROTATION_SPEED * delta_time
-		model_mat :=
-			linalg.matrix4_translate_f32({0, 0, -2}) *
-			linalg.matrix4_rotate_f32(rotation, {0, 1, 0})
+		// Create model matrix with translation based on position
+		model_mat := linalg.matrix4_translate_f32({position.x, position.y, -2})
 
 		ubo := UBO {
 			mvp = proj_mat * model_mat,
@@ -284,8 +306,8 @@ load_shader :: proc(
 		{
 			code_size = len(code),
 			code = raw_data(code),
-			entrypoint = "main",
-			format = {.SPIRV},
+			entrypoint = strings.clone_to_cstring(entrypoint),
+			format = GPU_SHADER_FORMAT,
 			stage = stage,
 			num_uniform_buffers = num_uniform_buffers,
 			num_samplers = num_samplers,
